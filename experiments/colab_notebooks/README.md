@@ -17,4 +17,4 @@ These notebooks complement the individual `.py` snapshots in `../colab_sources/`
 
 ## Compact upload bundle
 
-For review in chat, upload [handtracker_analysis_upload.zip](handtracker_analysis_upload.zip). It contains the relevant notebooks split into smaller pieces, code, reports, and textual outputs. It excludes rendered images/HTML, datasets, checkpoints, videos, and credentials. The original notebook snapshots remain above; the analysis-ready copies are in analysis_ready/.
+For analysis, upload [handtracker_analysis_upload.zip](handtracker_analysis_upload.zip). It now contains only the successful acquisition/repair, cache, and training code plus text result excerpts. Rendered images, HTML outputs, failed experiments, unrelated notebooks, datasets, and checkpoints are excluded.

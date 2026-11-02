@@ -114,7 +114,7 @@ def our_state_to_mano(state: Any) -> Tuple[np.ndarray, np.ndarray, np.ndarray, n
     """Compatibility interface for unit test suite."""
     global_trans = state.T.copy()
     pose_aa = np.zeros(45, dtype=np.float64)
-    betas = np.zeros(10, dtype=np.float64)
+    betas = np.asarray(getattr(state, "beta", np.zeros(10)), dtype=np.float64).copy()
     root_aa = np.zeros(3, dtype=np.float64)
     return global_trans, root_aa, pose_aa, betas
 
@@ -138,11 +138,13 @@ class ManoSurface:
         self.v_template: Optional[np.ndarray] = None
         self.weights: Optional[np.ndarray] = None
         self.J_regressor: Optional[np.ndarray] = None
+        self.shapedirs: Optional[np.ndarray] = None
         self.joints_16_rest: Optional[np.ndarray] = None
 
         # Precomputed local coordinate frames and lengths in MANO rest template
         self.F_rest_mano = np.zeros((16, 3, 3), dtype=np.float64)
         self.L_rest_mano = np.zeros(16, dtype=np.float64)
+        self._shape_cache: Dict[Tuple[float, ...], Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
 
         if self.model_path and Path(self.model_path).is_file():
             self._load_model()
@@ -150,6 +152,54 @@ class ManoSurface:
     @property
     def is_available(self) -> bool:
         return self._is_available
+
+    def _geometry_for_beta(
+        self, beta: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Return shaped MANO template, rest joints, bone frames, and lengths."""
+        if self.v_template is None or self.J_regressor is None or self.shapedirs is None:
+            raise RuntimeError("MANO shape assets are not loaded")
+        beta = np.asarray(beta, dtype=np.float64).reshape(10)
+        key = tuple(np.round(beta, 6).tolist())
+        cached = self._shape_cache.get(key)
+        if cached is not None:
+            return cached
+
+        shaped_vertices = self.v_template + np.tensordot(
+            self.shapedirs, beta, axes=([2], [0])
+        )
+        rest_joints = self.J_regressor @ shaped_vertices
+        v_x_palm = rest_joints[1] - rest_joints[7]
+        v_y_palm = rest_joints[4] - rest_joints[0]
+        v_y_palm /= max(float(np.linalg.norm(v_y_palm)), 1e-12)
+        v_x_palm = v_x_palm - np.dot(v_x_palm, v_y_palm) * v_y_palm
+        v_x_palm /= max(float(np.linalg.norm(v_x_palm)), 1e-12)
+        v_z_palm = np.cross(v_x_palm, v_y_palm)
+
+        frames = np.zeros((16, 3, 3), dtype=np.float64)
+        lengths = np.zeros(16, dtype=np.float64)
+        for j, _our_p, _our_c, is_joint, child_id in BONE_MAP:
+            p_start = rest_joints[j]
+            p_end = rest_joints[child_id] if is_joint else shaped_vertices[child_id]
+            bone_vec = p_end - p_start
+            length = max(float(np.linalg.norm(bone_vec)), 1e-4)
+            lengths[j] = length
+            y_axis = bone_vec / length
+            x_ref = v_z_palm if j in [13, 14, 15] else v_x_palm
+            x_axis = x_ref - np.dot(x_ref, y_axis) * y_axis
+            x_norm = float(np.linalg.norm(x_axis))
+            if x_norm > 1e-6:
+                x_axis /= x_norm
+            else:
+                x_axis = np.asarray([1.0, 0.0, 0.0])
+            z_axis = np.cross(x_axis, y_axis)
+            frames[j] = np.column_stack([x_axis, y_axis, z_axis])
+
+        result = (shaped_vertices, rest_joints, frames, lengths)
+        if len(self._shape_cache) >= 32:
+            self._shape_cache.pop(next(iter(self._shape_cache)))
+        self._shape_cache[key] = result
+        return result
 
     def _load_model(self):
         try:
@@ -168,42 +218,17 @@ class ManoSurface:
             self.faces = to_arr(data['f'], np.int32)
             self.weights = to_arr(data['weights'], np.float64)
             self.J_regressor = to_arr(data['J_regressor'], np.float64)
-            self.joints_16_rest = self.J_regressor @ self.v_template
-
-            # 1. Compute canonical palm basis
-            v_x_palm = self.joints_16_rest[1] - self.joints_16_rest[7]  # Index MCP to Pinky MCP
-            v_y_palm = self.joints_16_rest[4] - self.joints_16_rest[0]  # Wrist to Middle MCP
-            v_y_palm /= np.linalg.norm(v_y_palm)
-            v_x_palm = v_x_palm - np.dot(v_x_palm, v_y_palm) * v_y_palm
-            v_x_palm /= np.linalg.norm(v_x_palm)
-            v_z_palm = np.cross(v_x_palm, v_y_palm)
-
-            # 2. Compute reference coordinate frame and bone length for all 16 joints
-            for j, p_idx, c_idx, is_joint, child_id in BONE_MAP:
-                p_start = self.joints_16_rest[j]
-                p_end = self.joints_16_rest[child_id] if is_joint else self.v_template[child_id]
-                bone_vec = p_end - p_start
-                length = float(np.linalg.norm(bone_vec))
-                self.L_rest_mano[j] = max(length, 1e-4)
-
-                y_axis = bone_vec / self.L_rest_mano[j]
-
-                # Align transverse and normal axes
-                if j in [13, 14, 15]:  # Thumb chain
-                    x_ref = v_z_palm
-                else:                  # Palm and fingers
-                    x_ref = v_x_palm
-
-                x_axis = x_ref - np.dot(x_ref, y_axis) * y_axis
-                x_norm = np.linalg.norm(x_axis)
-                if x_norm > 1e-6:
-                    x_axis /= x_norm
-                else:
-                    x_axis = np.array([1.0, 0.0, 0.0])
-                z_axis = np.cross(x_axis, y_axis)
-
-                # Column matrix: [x | y | z]
-                self.F_rest_mano[j] = np.column_stack([x_axis, y_axis, z_axis])
+            shapedirs = to_arr(data['shapedirs'], np.float64)
+            if shapedirs.ndim == 2 and shapedirs.shape[0] == self.v_template.size:
+                shapedirs = shapedirs.reshape(self.v_template.shape[0], 3, -1)
+            elif shapedirs.ndim == 3 and shapedirs.shape[1:] == (self.v_template.shape[0], 3):
+                shapedirs = np.transpose(shapedirs, (1, 2, 0))
+            if (shapedirs.ndim != 3 or shapedirs.shape[:2] != (self.v_template.shape[0], 3)
+                    or shapedirs.shape[2] < 10):
+                raise ValueError(f"Unexpected MANO shapedirs shape: {shapedirs.shape}")
+            self.shapedirs = shapedirs[:, :, :10].copy()
+            self._shape_cache.clear()
+            _, self.joints_16_rest, self.F_rest_mano, self.L_rest_mano = self._geometry_for_beta(np.zeros(10))
 
             self._is_available = True
             print(f"[MANO Backend] Loaded and calibrated '{self.model_path}' to FK skeleton.")
@@ -211,15 +236,25 @@ class ManoSurface:
             print(f"[MANO Backend] Warning: Failed to load '{self.model_path}': {e}")
             self._is_available = False
 
-    def forward(self, state: Any, joint_positions: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def forward(
+        self,
+        state: Any,
+        joint_positions: Optional[np.ndarray] = None,
+        biometrics: Optional[Any] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Calculates MANO mesh vertices wrapped tightly around the FK skeleton.
         """
         if not self._is_available:
             raise FileNotFoundError(f"MANO model asset not available at '{self.model_path}'.")
 
-        # Evaluate authoritative FK skeleton if positions/rotations are not pre-supplied
-        joint_pos_3d, joint_rot_3d = forward_kinematics(state)
+        # Use the same per-user shape for the mesh and the authoritative FK
+        # skeleton. Supplied positions avoid a duplicate FK pass but rotations
+        # are still needed to skin the MANO template.
+        fk_positions, joint_rot_3d = forward_kinematics(state, biometrics)
+        joint_pos_3d = fk_positions if joint_positions is None else np.asarray(joint_positions, dtype=np.float64)
+        beta = np.asarray(getattr(state, "beta", np.zeros(10)), dtype=np.float64)
+        shaped_template, rest_joints, rest_frames, rest_lengths = self._geometry_for_beta(beta)
 
         # Affine bone transformation matrices: M_j (3x3), t_j (3)
         M_all = np.zeros((16, 3, 3), dtype=np.float64)
@@ -232,7 +267,7 @@ class ManoSurface:
             length_ours = float(np.linalg.norm(bone_vec_ours))
 
             # Scale factor along the bone shaft
-            s_long = length_ours / self.L_rest_mano[j]
+            s_long = length_ours / rest_lengths[j]
             # Cross-sectional scale proportional to shaft length
             s_cross = float(np.clip(np.sqrt(s_long), 0.85, 1.15))
 
@@ -242,8 +277,8 @@ class ManoSurface:
             F_ours = joint_rot_3d[our_p]
 
             # M_j maps MANO rest coordinates into our deformed bone coordinate frame
-            M_j = F_ours @ S_mat @ self.F_rest_mano[j].T
-            t_j = p_start - M_j @ self.joints_16_rest[j]
+            M_j = F_ours @ S_mat @ rest_frames[j].T
+            t_j = p_start - M_j @ rest_joints[j]
 
             M_all[j] = M_j
             t_all[j] = t_j
@@ -251,7 +286,7 @@ class ManoSurface:
         # Vectorized Linear Blend Skinning
         T_blend = np.einsum('vj,jab->vab', self.weights, M_all)
         t_blend = self.weights @ t_all
-        v_world = np.einsum('vab,vb->va', T_blend, self.v_template) + t_blend
+        v_world = np.einsum('vab,vb->va', T_blend, shaped_template) + t_blend
 
         # Reconstructed 21-landmark array
         k_world_21 = np.zeros((21, 3), dtype=np.float64)

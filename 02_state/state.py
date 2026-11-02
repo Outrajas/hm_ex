@@ -101,5 +101,10 @@ def state_update(current_state: HandState, control: ControlInput, dt: float) -> 
         q=next_q,
         V=next_V,
         omega=next_omega,
-        qdot=next_qdot
+        qdot=next_qdot,
+        # Shape is a calibrated per-user parameter, not a per-frame output.
+        # Preserve it across every temporal state transition.
+        beta=current_state.beta.copy(),
+        delta_G=current_state.delta_G.copy(),
+        delta_G_dot=current_state.delta_G_dot.copy(),
     )

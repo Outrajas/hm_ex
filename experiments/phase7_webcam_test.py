@@ -51,6 +51,39 @@ FINGER_COLORS = [
 ]
 
 
+class OrientedRenderedPriorInput(RenderedPriorInput):
+    """Use raw-camera intrinsics while displaying a rotated/mirrored frame."""
+
+    def __init__(self, intrinsics, *, raw_width, raw_height, rotation, mirror, **kwargs):
+        super().__init__(intrinsics, **kwargs)
+        self.raw_width = int(raw_width)
+        self.raw_height = int(raw_height)
+        self.rotation = int(rotation)
+        self.mirror = bool(mirror)
+        self.raw_cx = (self.raw_width - 1) * 0.5
+        self.raw_cy = (self.raw_height - 1) * 0.5
+        self.raw_fx = float(intrinsics.fx)
+        self.raw_fy = float(intrinsics.fy)
+
+    def _project(self, points_m):
+        points_mm = np.asarray(points_m, dtype=np.float32) * 1000.0
+        z = points_mm[:, 2]
+        valid = z > 1.0
+        safe_z = np.where(valid, z, 1.0)
+        u = self.raw_fx * points_mm[:, 0] / safe_z + self.raw_cx
+        v = self.raw_fy * points_mm[:, 1] / safe_z + self.raw_cy
+
+        if self.rotation == 90:
+            u, v = self.raw_height - 1.0 - v, u
+        elif self.rotation == 180:
+            u, v = self.raw_width - 1.0 - u, self.raw_height - 1.0 - v
+        elif self.rotation == 270:
+            u, v = v, self.raw_width - 1.0 - u
+        if self.mirror:
+            u = self.intrinsics.width - 1.0 - u
+        return np.column_stack((u, v)).astype(np.float32), valid
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -59,8 +92,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mano", default=str(ROOT / "models" / "MANO_RIGHT.pkl"))
     parser.add_argument("--camera", type=int, default=0)
-    parser.add_argument("--width", type=int, default=640)
-    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--width", type=int, default=1280)
+    parser.add_argument("--height", type=int, default=720)
+    parser.add_argument("--rotate", type=int, choices=(0, 90, 180, 270), default=180,
+                        help="Rotate image and MANO projection together; default 180 for the reported upside-down feed.")
+    parser.add_argument("--mirror", action="store_true",
+                        help="Mirror the camera image horizontally (selfie view).")
+    parser.add_argument("--correction-strength", type=float, default=0.25,
+                        help="Damp the model's state update; use 0 to inspect the static seed.")
     parser.add_argument("--hfov", type=float, default=60.0,
                         help="Approximate webcam horizontal field of view in degrees.")
     parser.add_argument("--focal-px", type=float, default=0.0,
@@ -132,23 +171,41 @@ def make_seed(depth: float) -> tuple[HandState, tuple[float, float, float]]:
     return state, (0.0, 0.0, yaw)
 
 
-def project_joints(joints_m: np.ndarray, intr: CameraIntrinsics) -> tuple[np.ndarray, np.ndarray]:
-    z = joints_m[:, 2]
-    valid = z > 0.01
-    safe_z = np.where(valid, z, 1.0)
-    uv = np.column_stack((
-        intr.fx * joints_m[:, 0] / safe_z + intr.cx,
-        intr.fy * joints_m[:, 1] / safe_z + intr.cy,
-    ))
-    return uv, valid
-
-
-def draw_camera_overlay(frame: np.ndarray, state: HandState, biometrics: HandBiometrics,
-                        intr: CameraIntrinsics, tracking: bool, authority: float,
-                        fps: float) -> np.ndarray:
+def draw_camera_overlay(frame: np.ndarray, joints_m: np.ndarray, vertices_m: np.ndarray,
+                        faces: np.ndarray, renderer: OrientedRenderedPriorInput,
+                        tracking: bool, authority: float, fps: float) -> np.ndarray:
     out = frame.copy()
-    joints_m, _ = forward_kinematics(state, biometrics)
-    uv, valid = project_joints(joints_m, intr)
+    uv, valid = renderer._project(joints_m)
+    mesh_uv, mesh_valid = renderer._project(vertices_m)
+    faces = np.asarray(faces, dtype=np.int32)
+    face_valid = mesh_valid[faces].all(axis=1)
+    if np.any(face_valid):
+        # Painter's order makes the nearer MANO triangles cover the farther ones.
+        face_depth = vertices_m[faces, 2].mean(axis=1)
+        order = np.flatnonzero(face_valid)[np.argsort(face_depth[face_valid])[::-1]]
+        mesh_layer = np.zeros_like(out)
+        mesh_mask = np.zeros(out.shape[:2], dtype=np.uint8)
+        vertices_px = np.rint(mesh_uv).astype(np.int32)
+        for face_i in order:
+            tri = faces[face_i]
+            pts = vertices_px[tri]
+            a, b, c = vertices_m[tri]
+            normal = np.cross(b - a, c - a)
+            norm = float(np.linalg.norm(normal))
+            if norm > 1e-10:
+                normal /= norm
+            light = abs(float(np.dot(normal, np.asarray([0.25, 0.55, -0.80]))))
+            shade = 0.58 + 0.42 * light
+            color = (int(125 * shade), int(165 * shade), int(205 * shade))
+            cv2.fillConvexPoly(mesh_layer, pts, color, lineType=cv2.LINE_AA)
+            cv2.fillConvexPoly(mesh_mask, pts, 255, lineType=cv2.LINE_AA)
+        covered = mesh_mask > 0
+        out[covered] = (
+            0.60 * out[covered].astype(np.float32)
+            + 0.40 * mesh_layer[covered].astype(np.float32)
+        ).clip(0, 255).astype(np.uint8)
+        cv2.polylines(out, [cv2.convexHull(vertices_px[mesh_valid])], True,
+                      (70, 230, 120), 2, cv2.LINE_AA)
     pts = np.rint(uv).astype(np.int32)
     for bone_i, (parent, child) in enumerate(BONE_PAIRS):
         if valid[parent] and valid[child]:
@@ -168,14 +225,16 @@ def draw_camera_overlay(frame: np.ndarray, state: HandState, biometrics: HandBio
     return out
 
 
-def draw_3d_skeleton(state: HandState, biometrics: HandBiometrics,
-                     panel_size: tuple[int, int]) -> np.ndarray:
+def draw_3d_mano(state: HandState, joints_m: np.ndarray, vertices_m: np.ndarray,
+                 faces: np.ndarray, panel_size: tuple[int, int],
+                 input_size: int) -> np.ndarray:
     width, height = panel_size
     panel = np.full((height, width, 3), (27, 29, 36), dtype=np.uint8)
-    cv2.putText(panel, "SIMULATED 3D HAND (camera/world axes)", (12, 24),
+    cv2.putText(panel, "LIVE MANO SURFACE + FK SKELETON", (12, 24),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, (225, 230, 240), 1, cv2.LINE_AA)
-    joints, _ = forward_kinematics(state, biometrics)
-    centered = joints - joints[0:1]
+    cv2.putText(panel, "MANO shape is rendered from the current state; not a measured hand fit",
+                (12, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.36,
+                (180, 190, 205), 1, cv2.LINE_AA)
 
     yaw, pitch = 0.55, -0.22
     cy, sy = np.cos(yaw), np.sin(yaw)
@@ -185,21 +244,74 @@ def draw_3d_skeleton(state: HandState, biometrics: HandBiometrics,
         [0.0, cp, -sp],
         [-sy, cy * sp, cy * cp],
     ], dtype=np.float64)
-    view = centered @ rot.T
-    span = max(float(np.ptp(view[:, 0])), float(np.ptp(view[:, 1])), 0.10)
-    scale = min((width - 60) / span, (height - 72) / span)
-    origin = np.asarray([width * 0.5, height * 0.57])
-    px = np.rint(np.column_stack((
-        origin[0] + view[:, 0] * scale,
-        origin[1] - view[:, 1] * scale,
+    mesh_view = (vertices_m - joints_m[0:1]) @ rot.T
+    joint_view = (joints_m - joints_m[0:1]) @ rot.T
+    span = max(float(np.ptp(mesh_view[:, 0])), float(np.ptp(mesh_view[:, 1])), 0.10)
+    scale = min((width - 48) / span, (height - 56) / span)
+    origin = np.asarray([width * 0.5, height * 0.48])
+    mesh_px = np.rint(np.column_stack((
+        origin[0] + mesh_view[:, 0] * scale,
+        origin[1] - mesh_view[:, 1] * scale,
     ))).astype(np.int32)
+    joint_px = np.rint(np.column_stack((
+        origin[0] + joint_view[:, 0] * scale,
+        origin[1] - joint_view[:, 1] * scale,
+    ))).astype(np.int32)
+
+    # Painter's algorithm is enough for this small live preview mesh.
+    tri_depth = mesh_view[np.asarray(faces, dtype=np.int64), 2].mean(axis=1)
+    for face_i in np.argsort(tri_depth):
+        tri = np.asarray(faces[face_i], dtype=np.int64)
+        tri_view = mesh_view[tri]
+        normal = np.cross(tri_view[1] - tri_view[0], tri_view[2] - tri_view[0])
+        norm = float(np.linalg.norm(normal))
+        if norm > 1e-8:
+            normal /= norm
+        shade = 0.45 + 0.55 * abs(float(np.dot(normal, np.asarray([0.25, 0.55, -0.80]))))
+        color = (int(95 * shade), int(135 * shade), int(175 * shade))
+        cv2.fillConvexPoly(panel, mesh_px[tri], color, lineType=cv2.LINE_AA)
+
     for bone_i, (parent, child) in enumerate(BONE_PAIRS):
-        cv2.line(panel, tuple(px[parent]), tuple(px[child]),
+        cv2.line(panel, tuple(joint_px[parent]), tuple(joint_px[child]),
                  FINGER_COLORS[min(bone_i // 4, 4)], 4, cv2.LINE_AA)
-    for joint_i, point in enumerate(px):
+    for joint_i, point in enumerate(joint_px):
         cv2.circle(panel, tuple(point), 5 if joint_i in (0, 4, 8, 12, 16, 20) else 3,
                    (245, 245, 245), -1, cv2.LINE_AA)
+    cv2.putText(panel, f"T=({state.T[0]:+.2f},{state.T[1]:+.2f},{state.T[2]:.2f}) m",
+                (12, height - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                (220, 225, 235), 1, cv2.LINE_AA)
+    cv2.putText(panel, f"MODEL INPUT: {input_size}x{input_size} crop",
+                (12, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                (180, 190, 205), 1, cv2.LINE_AA)
     return panel
+
+
+def orient_frame(frame: np.ndarray, rotation: int, mirror: bool) -> np.ndarray:
+    if rotation == 90:
+        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    elif rotation == 180:
+        frame = cv2.rotate(frame, cv2.ROTATE_180)
+    elif rotation == 270:
+        frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if mirror:
+        frame = cv2.flip(frame, 1)
+    return frame
+
+
+def damp_state(previous: HandState, updated: HandState, strength: float) -> HandState:
+    """Blend the learned update conservatively to suppress unstable jumps."""
+    strength = float(np.clip(strength, 0.0, 1.0))
+    out = previous.copy()
+    for name in ("T", "q", "V", "omega", "qdot"):
+        a, b = getattr(previous, name), getattr(updated, name)
+        setattr(out, name, a + strength * (b - a))
+    q1, q2 = previous.R.copy(), updated.R.copy()
+    if float(np.dot(q1, q2)) < 0:
+        q2 = -q2
+    q = q1 + strength * (q2 - q1)
+    out.R = q / max(float(np.linalg.norm(q)), 1e-9)
+    out.beta = updated.beta.copy()
+    return out
 
 
 def adjust_seed(state: HandState, angles: list[float], key: int) -> bool:
@@ -250,6 +362,8 @@ def adjust_seed(state: HandState, angles: list[float], key: int) -> bool:
 
 def main() -> None:
     args = parse_args()
+    if not 0.0 <= args.correction_strength <= 1.0:
+        raise ValueError("--correction-strength must be between 0 and 1")
     device = choose_device(args.device)
     checkpoint_path = Path(args.checkpoint).expanduser().resolve()
     mano_path = Path(args.mano).expanduser().resolve()
@@ -268,6 +382,7 @@ def main() -> None:
         cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open webcam index {args.camera}.")
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -276,11 +391,17 @@ def main() -> None:
     if not ok or first is None:
         cap.release()
         raise RuntimeError("Webcam opened but returned no frames.")
+    raw_height, raw_width = first.shape[:2]
+    first = orient_frame(first, args.rotate, args.mirror)
     height, width = first.shape[:2]
-    focal = float(args.focal_px) if args.focal_px > 0 else 0.5 * width / math.tan(math.radians(args.hfov) * 0.5)
-    intr = CameraIntrinsics(focal, focal, width * 0.5, height * 0.5, width, height)
-    renderer = RenderedPriorInput(
-        intr, biometrics=biometrics, mano_model_path=mano_path,
+    focal = float(args.focal_px) if args.focal_px > 0 else 0.5 * raw_width / math.tan(math.radians(args.hfov) * 0.5)
+    intr = CameraIntrinsics(
+        focal, focal, (width - 1) * 0.5, (height - 1) * 0.5, width, height
+    )
+    renderer = OrientedRenderedPriorInput(
+        intr, raw_width=raw_width, raw_height=raw_height,
+        rotation=args.rotate, mirror=args.mirror,
+        biometrics=biometrics, mano_model_path=mano_path,
         output_size=image_size, crop_margin=1.6,
     )
 
@@ -291,14 +412,19 @@ def main() -> None:
     window_name = "Phase 7 trained model — webcam smoke test"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     print(f"Checkpoint: {checkpoint_path}")
-    print(f"Device: {device}; input size: {image_size}; webcam: {width}x{height}; focal~{focal:.1f}px")
+    print(f"Device: {device}; model input: {image_size}x{image_size}; camera output: {width}x{height}; focal~{focal:.1f}px")
+    if width < args.width or height < args.height:
+        print(f"[WARN] Camera returned {width}x{height}, below requested {args.width}x{args.height}.")
+    print(f"Camera transform: rotate={args.rotate} degrees; mirror={args.mirror}; correction strength={args.correction_strength:.2f}")
     print("Align the green skeleton over an open palm facing the camera, fingers up; press SPACE to start.")
+    panel_width = 520
 
     try:
         while True:
             ok, frame = cap.read()
             if not ok or frame is None:
                 continue
+            frame = orient_frame(frame, args.rotate, args.mirror)
             now = time.perf_counter()
             dt = float(np.clip(now - last_time, 1.0 / 240.0, 0.25))
             last_time = now
@@ -307,13 +433,22 @@ def main() -> None:
 
             crop, _ = renderer(frame, state)
             if tracking:
+                previous_state = state.copy()
                 result = tracker.step(crop, dt_seconds=dt, measurement_valid=True)
-                state = result.state
+                state = damp_state(previous_state, result.state, args.correction_strength)
+                tracker.state = state.copy()
                 authority = result.authority
 
-            camera_view = draw_camera_overlay(frame, state, biometrics, intr,
-                                              tracking, authority, fps_ema)
-            panel = draw_3d_skeleton(state, biometrics, (420, height))
+            joints_m, _ = forward_kinematics(state, biometrics)
+            vertices_m, faces, _ = renderer.mano.forward(state, joints_m, biometrics)
+            camera_view = draw_camera_overlay(
+                frame, joints_m, vertices_m, faces, renderer,
+                tracking, authority, fps_ema,
+            )
+            panel = draw_3d_mano(
+                state, joints_m, vertices_m, faces,
+                (panel_width, height), image_size,
+            )
             crop_rgb = crop[:3].permute(1, 2, 0).cpu().numpy()
             crop_bgr = cv2.cvtColor(np.clip(crop_rgb * 255, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
             skeleton_mask = crop[4].cpu().numpy() > 0.5
@@ -327,7 +462,7 @@ def main() -> None:
                         (12, height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
                         (220, 225, 235), 1, cv2.LINE_AA)
 
-            canvas = np.zeros((height, width + 420, 3), dtype=np.uint8)
+            canvas = np.zeros((height, width + panel_width, 3), dtype=np.uint8)
             canvas[:, :width] = camera_view
             canvas[:, width:] = panel
             cv2.imshow(window_name, canvas)

@@ -248,16 +248,16 @@ def draw_3d_mano(state: HandState, joints_m: np.ndarray, vertices_m: np.ndarray,
     ], dtype=np.float64)
     mesh_view = (vertices_m - joints_m[0:1]) @ rot.T
     joint_view = (joints_m - joints_m[0:1]) @ rot.T
-    span = max(float(np.ptp(mesh_view[:, 0])), float(np.ptp(mesh_view[:, 1])), 0.10)
-    scale = min((width - 48) / span, (height - 56) / span)
+    # Fixed metres-to-pixels scale: finger articulation must not zoom the view.
+    scale = min((width - 48) / 0.30, (height - 96) / 0.40)
     origin = np.asarray([width * 0.5, height * 0.48])
     mesh_px = np.rint(np.column_stack((
         origin[0] + mesh_view[:, 0] * scale,
-        origin[1] - mesh_view[:, 1] * scale,
+        origin[1] + mesh_view[:, 1] * scale,
     ))).astype(np.int32)
     joint_px = np.rint(np.column_stack((
         origin[0] + joint_view[:, 0] * scale,
-        origin[1] - joint_view[:, 1] * scale,
+        origin[1] + joint_view[:, 1] * scale,
     ))).astype(np.int32)
 
     # Painter's algorithm is enough for this small live preview mesh.
@@ -266,13 +266,16 @@ def draw_3d_mano(state: HandState, joints_m: np.ndarray, vertices_m: np.ndarray,
     normals = np.cross(tri_view[:, 1] - tri_view[:, 0], tri_view[:, 2] - tri_view[:, 0])
     normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-9)
     tri_depth = tri_view[:, :, 2].mean(axis=1)
-    order = np.argsort(tri_depth)[::-1][::2]
+    # As in main.py, omit back-facing surfaces rather than arbitrary triangles.
+    # All camera-facing triangles remain, preserving a complete visible skin.
+    front = np.flatnonzero(normals[:, 2] < -1e-8)
+    order = front[np.argsort(tri_depth[front])[::-1]]
     light = np.abs(normals @ np.asarray([0.25, 0.55, -0.80]))
     shades = 0.45 + 0.55 * light
     for face_i in order:
         shade = float(shades[face_i])
         color = (int(95 * shade), int(135 * shade), int(175 * shade))
-        cv2.fillConvexPoly(panel, mesh_px[faces[face_i]], color, lineType=cv2.LINE_AA)
+        cv2.fillConvexPoly(panel, mesh_px[faces[face_i]], color, lineType=cv2.LINE_8)
 
     for bone_i, (parent, child) in enumerate(BONE_PAIRS):
         cv2.line(panel, tuple(joint_px[parent]), tuple(joint_px[child]),
@@ -317,6 +320,17 @@ def damp_state(previous: HandState, updated: HandState, strength: float) -> Hand
     return out
 
 
+def finger_curl_target(state: HandState, percentages) -> np.ndarray:
+    """Manual articulation controls, independent of the model or camera image."""
+    q = state.q.copy()
+    thumb = percentages[0] / 100.0
+    q[0:5] = thumb * np.asarray([0.5, 0.6, 0.3, 0.9, 1.3])
+    for percent, base in zip(percentages[1:], (5, 9, 13, 17)):
+        q[base + 1:base + 4] = (percent / 100.0) * np.asarray([1.45, 1.65, 1.30])
+    limits = importlib.import_module('02_state.constraints')
+    return np.clip(q, limits.JOINT_LIMITS_LOWER, limits.JOINT_LIMITS_UPPER)
+
+
 def adjust_seed(state: HandState, angles: list[float], key: int) -> bool:
     """Apply a small manual bootstrap adjustment; return whether changed."""
     step = 0.01
@@ -358,7 +372,7 @@ def adjust_seed(state: HandState, angles: list[float], key: int) -> bool:
         state.q[1:5] = np.clip(state.q[1:5] + math.radians(10), 0.0, math.radians(95))
     else:
         changed = False
-    if changed and key not in (ord("0"), ord("1"), ord("2"), ord("3"), ord("4"), ord("t")):
+    if changed and key in tuple(map(ord, "jlikuo")):
         state.R = coord.euler_to_quaternion(*angles)
     return changed
 
@@ -412,29 +426,56 @@ def main() -> None:
     authority = 0.0
     last_time = time.perf_counter()
     fps_ema = 0.0
+    last_report = last_time
+    model_steps = 0
     window_name = "Phase 7 trained model — webcam smoke test"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    controls_window = "MANUAL finger controls - moving a slider pauses the model"
+    cv2.namedWindow(controls_window, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(controls_window, 520, 300)
+    finger_names = ("Thumb", "Index", "Middle", "Ring", "Pinky")
+    for name in finger_names:
+        cv2.createTrackbar(name, controls_window, 0, 100, lambda value: None)
+    last_curls = (0, 0, 0, 0, 0)
+    manual_target = None
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Device: {device}; model input: {image_size}x{image_size}; camera output: {width}x{height}; focal~{focal:.1f}px")
     if width < args.width or height < args.height:
         print(f"[WARN] Camera returned {width}x{height}, below requested {args.width}x{args.height}.")
     print(f"Camera transform: rotate={args.rotate} degrees; mirror={args.mirror}; correction strength={args.correction_strength:.2f}")
     print("Align the green skeleton over an open palm facing the camera, fingers up; press SPACE to start.")
+    print("Finger sliders demonstrate MANUAL articulation. SPACE toggles learned corrections; R resets.")
     panel_width = 520
 
     try:
         while True:
+            frame_started = time.perf_counter()
             ok, frame = cap.read()
             if not ok or frame is None:
                 continue
             frame = orient_frame(frame, args.rotate, args.mirror)
             now = time.perf_counter()
-            dt = float(np.clip(now - last_time, 1.0 / 240.0, 0.25))
+            actual_dt = max(now - last_time, 1e-6)
+            dt = float(np.clip(actual_dt, 1.0 / 240.0, 0.25))
             last_time = now
-            fps = 1.0 / dt
+            fps = 1.0 / actual_dt
             fps_ema = fps if fps_ema == 0.0 else 0.90 * fps_ema + 0.10 * fps
 
+            curls = tuple(cv2.getTrackbarPos(name, controls_window) for name in finger_names)
+            if curls != last_curls:
+                manual_target = finger_curl_target(state, curls)
+                last_curls = curls
+                tracking = False
+                authority = 0.0
+            if manual_target is not None and not tracking:
+                state.q += (1.0 - math.exp(-actual_dt / 0.08)) * (manual_target - state.q)
+                state.V[:] = 0.0
+                state.omega[:] = 0.0
+                state.qdot[:] = 0.0
+                tracker.reset(state)
+
             crop, _ = renderer(frame, state)
+            crop_finished = time.perf_counter()
             # Use the mesh that the renderer just produced for this prior. The
             # corrected state is displayed on the next frame, avoiding another
             # MANO skinning pass and keeping image/state alignment exact.
@@ -450,11 +491,17 @@ def main() -> None:
                 state = damp_state(previous_state, result.state, args.correction_strength)
                 tracker.state = state.copy()
                 authority = result.authority
+                model_steps += 1
+
+            inference_finished = time.perf_counter()
 
             camera_view = draw_camera_overlay(
                 frame, joints_m, vertices_m, faces, renderer,
                 tracking, authority, fps_ema,
             )
+            cv2.putText(camera_view, "MODEL CORRECTION" if tracking else "MANUAL POSE / ALIGNMENT",
+                        (12, 49), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                        (0, 210, 255), 2, cv2.LINE_AA)
             panel = draw_3d_mano(
                 display_state, joints_m, vertices_m, faces,
                 (panel_width, height), image_size,
@@ -477,12 +524,25 @@ def main() -> None:
             canvas[:, width:] = panel
             cv2.imshow(window_name, canvas)
             key = cv2.waitKey(1) & 0xFF
+            finished = time.perf_counter()
+            if finished - last_report >= 2.0:
+                print(
+                    f"[live] camera={width}x{height} FPS={fps_ema:.1f} "
+                    f"capture={(now-frame_started)*1000:.1f}ms "
+                    f"input={(crop_finished-now)*1000:.1f}ms "
+                    f"model={(inference_finished-crop_finished)*1000:.1f}ms "
+                    f"display={(finished-inference_finished)*1000:.1f}ms "
+                    f"model_steps={model_steps} depth={state.T[2]:.3f}m",
+                    flush=True,
+                )
+                last_report = finished
             if key in (27, ord("q")):
                 break
             if key == ord(" "):
-                tracking = True
+                tracking = not tracking
+                manual_target = None
                 tracker.reset(state)
-                print("Temporal correction started; press SPACE again to reset its recurrent memory.")
+                print("Model corrections active." if tracking else "Model paused; manual pose controls active.")
                 continue
             if key == ord("r"):
                 state, angles_tuple = make_seed(args.depth)
@@ -490,8 +550,15 @@ def main() -> None:
                 tracker.reset(state)
                 tracking = False
                 authority = 0.0
+                manual_target = None
+                for name in finger_names:
+                    cv2.setTrackbarPos(name, controls_window, 0)
+                last_curls = (0, 0, 0, 0, 0)
                 continue
             if adjust_seed(state, angles, key):
+                tracking = False
+                authority = 0.0
+                manual_target = None
                 tracker.reset(state)
     finally:
         cap.release()

@@ -152,7 +152,18 @@ class PersistentHandTracker:
             delta_q=correction.delta_q[0].cpu().numpy().astype(np.float64),
             authority=authority,
         )
-        updated = state_update(self.state, control, dt)
+        transition_prior = self.state.copy()
+        if measurement_valid:
+            # The crop and model features describe this exact pose. Training
+            # supervises target - supplied_prior, without an extra V*dt or
+            # qdot*dt advance. Integrating here double-counts that motion.
+            transition_prior.V[:] = 0.0
+            transition_prior.omega[:] = 0.0
+            transition_prior.qdot[:] = 0.0
+        else:
+            # Omit residual fields so the engine also coasts orientation.
+            control = ControlInput(authority=0.0)
+        updated = state_update(transition_prior, control, dt)
         # The transition engine integrates the previous velocity. Damping here
         # bounds its coast during low confidence and brief occlusion.
         updated.V *= self.velocity_damping

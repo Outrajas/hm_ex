@@ -115,8 +115,9 @@ def parse_args() -> argparse.Namespace:
                         help="Rotate image and MANO projection together if the raw camera feed needs it.")
     parser.add_argument("--mirror", action="store_true",
                         help="Mirror the camera image horizontally (selfie view).")
-    parser.add_argument("--correction-strength", type=float, default=0.25,
-                        help="Damp the model's state update; use 0 to inspect the static seed.")
+    parser.add_argument("--correction-strength", type=float, default=1.0,
+                        help=("Scale the model's already confidence-gated correction. "
+                              "Default 1.0 matches training evaluation; lower only to damp instability."))
     parser.add_argument("--hfov", type=float, default=60.0,
                         help="Approximate webcam horizontal field of view in degrees.")
     parser.add_argument("--focal-px", type=float, default=0.0,
@@ -197,17 +198,35 @@ def draw_camera_overlay(frame: np.ndarray, joints_m: np.ndarray, vertices_m: np.
     faces = np.asarray(faces, dtype=np.int32)
     if int(mesh_valid.sum()) >= 3:
         vertices_px = np.rint(mesh_uv).astype(np.int32)
-        hull = cv2.convexHull(vertices_px[mesh_valid])
-        overlay = out.copy()
-        cv2.fillConvexPoly(overlay, hull, (90, 145, 185), lineType=cv2.LINE_AA)
-        cv2.addWeighted(overlay, 0.22, out, 0.78, 0.0, out)
-        cv2.polylines(out, [hull], True, (70, 230, 120), 2, cv2.LINE_AA)
-        # A sparse wireframe keeps MANO visible without rasterizing all 1,538
-        # triangles over the full-resolution camera image on every frame.
-        sparse_faces = faces[::8]
-        wire = [vertices_px[tri] for tri in sparse_faces if mesh_valid[tri].all()]
-        if wire:
-            cv2.polylines(out, wire, False, (115, 210, 170), 1, cv2.LINE_AA)
+        # Match main.py's MANO renderer: depth-sort all front-facing triangles
+        # and shade each face. Blend the complete model over the camera frame
+        # so the physical hand remains visible beneath the predicted surface.
+        triangles = vertices_m[faces]
+        normals = np.cross(
+            triangles[:, 1] - triangles[:, 0],
+            triangles[:, 2] - triangles[:, 0],
+        )
+        normal_lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+        normals /= np.maximum(normal_lengths, 1e-9)
+        front = np.flatnonzero((normals[:, 2] < -0.05) & mesh_valid[faces].all(axis=1))
+        mean_depth = triangles[:, :, 2].mean(axis=1)
+        order = front[np.argsort(mean_depth[front])[::-1]]
+        light_dir = np.asarray([0.4, -0.7, -0.6], dtype=np.float32)
+        light_dir /= max(float(np.linalg.norm(light_dir)), 1e-9)
+        mesh_layer = out.copy()
+        for face_i in order:
+            tri = faces[face_i]
+            polygon = vertices_px[tri]
+            # Avoid sending fully offscreen triangles through the rasterizer.
+            if (polygon[:, 0].max() < 0 or polygon[:, 1].max() < 0 or
+                    polygon[:, 0].min() >= out.shape[1] or
+                    polygon[:, 1].min() >= out.shape[0]):
+                continue
+            diffuse = float(np.clip(-np.dot(normals[face_i], light_dir), 0.0, 1.0))
+            shade = 0.35 + 0.65 * diffuse
+            color = (int(120 * shade), int(145 * shade), int(175 * shade))
+            cv2.fillConvexPoly(mesh_layer, polygon, color, lineType=cv2.LINE_8)
+        cv2.addWeighted(mesh_layer, 0.48, out, 0.52, 0.0, out)
     pts = np.rint(uv).astype(np.int32)
     for bone_i, (parent, child) in enumerate(BONE_PAIRS):
         if valid[parent] and valid[child]:
@@ -476,9 +495,8 @@ def main() -> None:
 
             crop, _ = renderer(frame, state)
             crop_finished = time.perf_counter()
-            # Use the mesh that the renderer just produced for this prior. The
-            # corrected state is displayed on the next frame, avoiding another
-            # MANO skinning pass and keeping image/state alignment exact.
+            # The input is rendered from the current prior. If tracking is on,
+            # display the corrected state on this same camera frame below.
             display_state = state.copy()
             joints_m = renderer.last_joints
             vertices_m = renderer.last_vertices
@@ -491,6 +509,12 @@ def main() -> None:
                 state = damp_state(previous_state, result.state, args.correction_strength)
                 tracker.state = state.copy()
                 authority = result.authority
+                # main.py renders MANO from the current HandState each frame.
+                # Do the same after inference so the skeleton and skin show
+                # the just-predicted pose instead of lagging one frame behind.
+                joints_m, _ = forward_kinematics(state, biometrics)
+                vertices_m, faces, _ = renderer.mano.forward(state, joints_m, biometrics)
+                display_state = state.copy()
                 model_steps += 1
 
             inference_finished = time.perf_counter()

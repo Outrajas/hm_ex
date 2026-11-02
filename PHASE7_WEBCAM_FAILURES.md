@@ -31,8 +31,10 @@ than main.py. Rendering improvements must not be presented as model accuracy.
    pane now uses fixed metres-to-pixels scaling. This does not prevent predicted
    camera depth from drifting.
 5. Duplicate MANO generation and Python per-triangle normals added runtime cost.
-   The viewer reuses the input renderer's mesh, vectorizes normals, and uses a
-   sparse wire overlay on camera. Displayed pose precedes correction by one frame.
+   The viewer reuses the input renderer's mesh and vectorizes normals. At this
+   revision the camera view uses the full depth-sorted mesh overlay; it costs
+   more CPU time than the prior sparse wire overlay. The corrected mesh is
+   regenerated once after inference to avoid display lag.
 6. FPS was calculated from clamped timestep. It now uses actual wall-clock frame
    intervals. Logs split capture, input, model and display costs.
 7. Finger sliders now provide smooth, reversible manual articulation of all five
@@ -79,3 +81,29 @@ Validate visual initialization on unseen images, then train and evaluate using
 the model's own preceding predictions. Evaluate recorded webcam sequences before
 claiming live fitting. Profile actual camera/GUI timing before promising 60 FPS.
 No new training is started by the viewer fixes or regression checks.
+
+## Follow-up inference correction — 2026-11-03
+
+The live viewer's extra `--correction-strength` multiplier defaulted to `0.25`
+after `PersistentHandTracker` had already applied the network's learned
+authority. That attenuated each learned update a second time and differed from
+the Phase 7 validation path. The default is now `1.0`; lowering it is an
+explicit user-selected damping option.
+
+While tracking, the preview now re-skins MANO once after inference and displays
+the corrected state on the same camera frame. Before this change, the mesh and
+skeleton were rendered from the pre-correction prior and only reflected the
+update on the next loop iteration. The camera overlay now follows `main.py`'s
+depth-sorted, front-facing MANO triangle rendering instead of drawing a hull
+and a sparse set of edges, so the whole hand surface is visible. The extra
+skinning and full camera overlay cost CPU time, so live FPS may be lower.
+`main.py`'s 60 FPS simulator omits camera capture, input rendering, neural
+inference, and this corrected-pose display pass; it is not a like-for-like
+throughput target.
+
+This is an inference/rendering correction, not a new automatic initializer.
+The model still starts from a seeded MANO pose and has no independent full-frame
+hand locator. Its input crop follows the current simulated pose. Thus the
+checkpoint is still not established as a reliable hands-off webcam tracker;
+this change only makes its learned corrections visible at full trained
+strength and removes the display's one-frame pose lag.

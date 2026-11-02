@@ -90,6 +90,11 @@ authority. That attenuated each learned update a second time and differed from
 the Phase 7 validation path. The default is now `1.0`; lowering it is an
 explicit user-selected damping option.
 
+The preview and its two-second console status now show learned authority,
+applied translation change, and joint-angle RMS change. This separates a
+rendering/camera orientation issue from a model that is emitting negligible
+updates during a user's next local run.
+
 While tracking, the preview now re-skins MANO once after inference and displays
 the corrected state on the same camera frame. Before this change, the mesh and
 skeleton were rendered from the pre-correction prior and only reflected the

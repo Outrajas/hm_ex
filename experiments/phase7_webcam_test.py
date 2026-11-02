@@ -447,6 +447,8 @@ def main() -> None:
     fps_ema = 0.0
     last_report = last_time
     model_steps = 0
+    applied_translation_mm = 0.0
+    applied_joint_rms_deg = 0.0
     window_name = "Phase 7 trained model — webcam smoke test"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     controls_window = "MANUAL finger controls - moving a slider pauses the model"
@@ -509,6 +511,10 @@ def main() -> None:
                 state = damp_state(previous_state, result.state, args.correction_strength)
                 tracker.state = state.copy()
                 authority = result.authority
+                applied_translation_mm = float(np.linalg.norm(state.T - previous_state.T) * 1000.0)
+                applied_joint_rms_deg = float(
+                    np.sqrt(np.mean(np.square(state.q - previous_state.q))) * 180.0 / np.pi
+                )
                 # main.py renders MANO from the current HandState each frame.
                 # Do the same after inference so the skeleton and skin show
                 # the just-predicted pose instead of lagging one frame behind.
@@ -526,6 +532,11 @@ def main() -> None:
             cv2.putText(camera_view, "MODEL CORRECTION" if tracking else "MANUAL POSE / ALIGNMENT",
                         (12, 49), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                         (0, 210, 255), 2, cv2.LINE_AA)
+            cv2.putText(
+                camera_view,
+                f"applied dT={applied_translation_mm:.1f}mm  joint RMS={applied_joint_rms_deg:.2f}deg",
+                (12, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 210, 255), 1, cv2.LINE_AA,
+            )
             panel = draw_3d_mano(
                 display_state, joints_m, vertices_m, faces,
                 (panel_width, height), image_size,
@@ -556,7 +567,9 @@ def main() -> None:
                     f"input={(crop_finished-now)*1000:.1f}ms "
                     f"model={(inference_finished-crop_finished)*1000:.1f}ms "
                     f"display={(finished-inference_finished)*1000:.1f}ms "
-                    f"model_steps={model_steps} depth={state.T[2]:.3f}m",
+                    f"model_steps={model_steps} authority={authority:.2f} "
+                    f"applied_dT={applied_translation_mm:.1f}mm "
+                    f"joint_RMS={applied_joint_rms_deg:.2f}deg depth={state.T[2]:.3f}m",
                     flush=True,
                 )
                 last_report = finished

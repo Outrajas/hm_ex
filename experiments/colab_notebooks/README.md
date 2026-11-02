@@ -14,3 +14,7 @@ The notebooks were checked as valid notebook JSON. A scan of their code and save
 The same Drive folder also contained a Kaggle U-Net notebook and generic/empty Colab examples; those are unrelated to the hand-tracker and are omitted. Dataset archives, extracted images, model weights, checkpoints, and authentication files are not included here.
 
 These notebooks complement the individual `.py` snapshots in `../colab_sources/`. Notebook cell history and outputs document the Colab workflow; the source archive is easier to diff and reuse as standalone code.
+
+## Compact upload bundle
+
+For review in chat, upload [handtracker_analysis_upload.zip](handtracker_analysis_upload.zip). It contains the relevant notebooks split into smaller pieces, code, reports, and textual outputs. It excludes rendered images/HTML, datasets, checkpoints, videos, and credentials. The original notebook snapshots remain above; the analysis-ready copies are in analysis_ready/.

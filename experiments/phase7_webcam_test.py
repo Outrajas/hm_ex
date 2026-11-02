@@ -64,6 +64,23 @@ class OrientedRenderedPriorInput(RenderedPriorInput):
         self.raw_cy = (self.raw_height - 1) * 0.5
         self.raw_fx = float(intrinsics.fx)
         self.raw_fy = float(intrinsics.fy)
+        self.last_joints = None
+        self.last_vertices = None
+        self.last_faces = None
+
+        # RenderedPriorInput already skins MANO while making its silhouette.
+        # Keep that exact result for the display so the webcam loop does not
+        # run MANO a second time per frame.
+        original_forward = self.mano.forward
+
+        def cached_forward(*args, **kwargs):
+            vertices, faces, joints = original_forward(*args, **kwargs)
+            self.last_vertices = vertices
+            self.last_faces = faces
+            self.last_joints = args[1] if len(args) > 1 and args[1] is not None else joints
+            return vertices, faces, joints
+
+        self.mano.forward = cached_forward
 
     def _project(self, points_m):
         points_mm = np.asarray(points_m, dtype=np.float32) * 1000.0
@@ -94,8 +111,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
-    parser.add_argument("--rotate", type=int, choices=(0, 90, 180, 270), default=180,
-                        help="Rotate image and MANO projection together; default 180 for the reported upside-down feed.")
+    parser.add_argument("--rotate", type=int, choices=(0, 90, 180, 270), default=0,
+                        help="Rotate image and MANO projection together if the raw camera feed needs it.")
     parser.add_argument("--mirror", action="store_true",
                         help="Mirror the camera image horizontally (selfie view).")
     parser.add_argument("--correction-strength", type=float, default=0.25,
@@ -178,34 +195,19 @@ def draw_camera_overlay(frame: np.ndarray, joints_m: np.ndarray, vertices_m: np.
     uv, valid = renderer._project(joints_m)
     mesh_uv, mesh_valid = renderer._project(vertices_m)
     faces = np.asarray(faces, dtype=np.int32)
-    face_valid = mesh_valid[faces].all(axis=1)
-    if np.any(face_valid):
-        # Painter's order makes the nearer MANO triangles cover the farther ones.
-        face_depth = vertices_m[faces, 2].mean(axis=1)
-        order = np.flatnonzero(face_valid)[np.argsort(face_depth[face_valid])[::-1]]
-        mesh_layer = np.zeros_like(out)
-        mesh_mask = np.zeros(out.shape[:2], dtype=np.uint8)
+    if int(mesh_valid.sum()) >= 3:
         vertices_px = np.rint(mesh_uv).astype(np.int32)
-        for face_i in order:
-            tri = faces[face_i]
-            pts = vertices_px[tri]
-            a, b, c = vertices_m[tri]
-            normal = np.cross(b - a, c - a)
-            norm = float(np.linalg.norm(normal))
-            if norm > 1e-10:
-                normal /= norm
-            light = abs(float(np.dot(normal, np.asarray([0.25, 0.55, -0.80]))))
-            shade = 0.58 + 0.42 * light
-            color = (int(125 * shade), int(165 * shade), int(205 * shade))
-            cv2.fillConvexPoly(mesh_layer, pts, color, lineType=cv2.LINE_AA)
-            cv2.fillConvexPoly(mesh_mask, pts, 255, lineType=cv2.LINE_AA)
-        covered = mesh_mask > 0
-        out[covered] = (
-            0.60 * out[covered].astype(np.float32)
-            + 0.40 * mesh_layer[covered].astype(np.float32)
-        ).clip(0, 255).astype(np.uint8)
-        cv2.polylines(out, [cv2.convexHull(vertices_px[mesh_valid])], True,
-                      (70, 230, 120), 2, cv2.LINE_AA)
+        hull = cv2.convexHull(vertices_px[mesh_valid])
+        overlay = out.copy()
+        cv2.fillConvexPoly(overlay, hull, (90, 145, 185), lineType=cv2.LINE_AA)
+        cv2.addWeighted(overlay, 0.22, out, 0.78, 0.0, out)
+        cv2.polylines(out, [hull], True, (70, 230, 120), 2, cv2.LINE_AA)
+        # A sparse wireframe keeps MANO visible without rasterizing all 1,538
+        # triangles over the full-resolution camera image on every frame.
+        sparse_faces = faces[::8]
+        wire = [vertices_px[tri] for tri in sparse_faces if mesh_valid[tri].all()]
+        if wire:
+            cv2.polylines(out, wire, False, (115, 210, 170), 1, cv2.LINE_AA)
     pts = np.rint(uv).astype(np.int32)
     for bone_i, (parent, child) in enumerate(BONE_PAIRS):
         if valid[parent] and valid[child]:
@@ -259,17 +261,18 @@ def draw_3d_mano(state: HandState, joints_m: np.ndarray, vertices_m: np.ndarray,
     ))).astype(np.int32)
 
     # Painter's algorithm is enough for this small live preview mesh.
-    tri_depth = mesh_view[np.asarray(faces, dtype=np.int64), 2].mean(axis=1)
-    for face_i in np.argsort(tri_depth):
-        tri = np.asarray(faces[face_i], dtype=np.int64)
-        tri_view = mesh_view[tri]
-        normal = np.cross(tri_view[1] - tri_view[0], tri_view[2] - tri_view[0])
-        norm = float(np.linalg.norm(normal))
-        if norm > 1e-8:
-            normal /= norm
-        shade = 0.45 + 0.55 * abs(float(np.dot(normal, np.asarray([0.25, 0.55, -0.80]))))
+    faces = np.asarray(faces, dtype=np.int32)
+    tri_view = mesh_view[faces]
+    normals = np.cross(tri_view[:, 1] - tri_view[:, 0], tri_view[:, 2] - tri_view[:, 0])
+    normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-9)
+    tri_depth = tri_view[:, :, 2].mean(axis=1)
+    order = np.argsort(tri_depth)[::-1][::2]
+    light = np.abs(normals @ np.asarray([0.25, 0.55, -0.80]))
+    shades = 0.45 + 0.55 * light
+    for face_i in order:
+        shade = float(shades[face_i])
         color = (int(95 * shade), int(135 * shade), int(175 * shade))
-        cv2.fillConvexPoly(panel, mesh_px[tri], color, lineType=cv2.LINE_AA)
+        cv2.fillConvexPoly(panel, mesh_px[faces[face_i]], color, lineType=cv2.LINE_AA)
 
     for bone_i, (parent, child) in enumerate(BONE_PAIRS):
         cv2.line(panel, tuple(joint_px[parent]), tuple(joint_px[child]),
@@ -432,6 +435,15 @@ def main() -> None:
             fps_ema = fps if fps_ema == 0.0 else 0.90 * fps_ema + 0.10 * fps
 
             crop, _ = renderer(frame, state)
+            # Use the mesh that the renderer just produced for this prior. The
+            # corrected state is displayed on the next frame, avoiding another
+            # MANO skinning pass and keeping image/state alignment exact.
+            display_state = state.copy()
+            joints_m = renderer.last_joints
+            vertices_m = renderer.last_vertices
+            faces = renderer.last_faces
+            if joints_m is None or vertices_m is None or faces is None:
+                raise RuntimeError("MANO prior render did not return its cached mesh.")
             if tracking:
                 previous_state = state.copy()
                 result = tracker.step(crop, dt_seconds=dt, measurement_valid=True)
@@ -439,26 +451,24 @@ def main() -> None:
                 tracker.state = state.copy()
                 authority = result.authority
 
-            joints_m, _ = forward_kinematics(state, biometrics)
-            vertices_m, faces, _ = renderer.mano.forward(state, joints_m, biometrics)
             camera_view = draw_camera_overlay(
                 frame, joints_m, vertices_m, faces, renderer,
                 tracking, authority, fps_ema,
             )
             panel = draw_3d_mano(
-                state, joints_m, vertices_m, faces,
+                display_state, joints_m, vertices_m, faces,
                 (panel_width, height), image_size,
             )
             crop_rgb = crop[:3].permute(1, 2, 0).cpu().numpy()
             crop_bgr = cv2.cvtColor(np.clip(crop_rgb * 255, 0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
             skeleton_mask = crop[4].cpu().numpy() > 0.5
             crop_bgr[skeleton_mask] = (0, 255, 0)
-            crop_view = cv2.resize(crop_bgr, (180, 180), interpolation=cv2.INTER_NEAREST)
+            crop_view = cv2.resize(crop_bgr, (180, 180), interpolation=cv2.INTER_LINEAR)
             x0, y0 = 14, max(34, height - 196)
             panel[y0:y0 + 180, x0:x0 + 180] = crop_view
             cv2.putText(panel, "RGB crop + prior skeleton", (x0, y0 - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 225, 235), 1, cv2.LINE_AA)
-            cv2.putText(panel, f"depth {state.T[2]:.2f} m | learned authority {authority:.2f}",
+            cv2.putText(panel, f"depth {display_state.T[2]:.2f} m | learned authority {authority:.2f}",
                         (12, height - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
                         (220, 225, 235), 1, cv2.LINE_AA)
 
